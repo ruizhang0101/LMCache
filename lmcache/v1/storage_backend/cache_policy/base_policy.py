@@ -15,6 +15,9 @@ class BaseCachePolicy(Generic[TCache], metaclass=abc.ABCMeta):
     Interface for cache policy.
     """
 
+    def __init__(self, **kwargs: Any) -> None:
+        pass
+
     @abc.abstractmethod
     def init_mutable_mapping(self) -> TCache:
         """

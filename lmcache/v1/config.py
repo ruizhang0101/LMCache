@@ -335,6 +335,34 @@ _CONFIG_DEFINITIONS: dict[str, dict[str, Any]] = {
         "default": "LRU",
         "env_converter": str,
     },
+    # DRRIP cache policy configurations
+    "drrip_max_rrpv": {
+        "type": int,
+        "default": 3,
+        "env_converter": int,
+    },
+    "drrip_brrip_short_insert_prob": {
+        "type": int,
+        "default": 32,
+        "env_converter": int,
+    },
+    "drrip_psel_max": {
+        "type": int,
+        "default": 1023,
+        "env_converter": int,
+    },
+    "drrip_leader_set_mask": {
+        "type": int,
+        "default": 0x1F,
+        "env_converter": lambda x: int(x, 0)
+        if isinstance(x, str) and x.startswith("0x")
+        else int(x),
+    },
+    "drrip_srrip_insert_rrpv": {
+        "type": int,
+        "default": 2,
+        "env_converter": int,
+    },
     "numa_mode": {
         "type": Optional[str],
         "default": None,

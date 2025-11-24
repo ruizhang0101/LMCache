@@ -53,7 +53,7 @@ class LocalCPUBackend(AllocatorBackendInterface):
         else:
             super().__init__("cpu")
 
-        self.cache_policy = get_cache_policy(config.cache_policy)
+        self.cache_policy = get_cache_policy(config.cache_policy, config)
         self.hot_cache = self.cache_policy.init_mutable_mapping()
 
         self.use_hot = config.local_cpu

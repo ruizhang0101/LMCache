@@ -1,0 +1,11 @@
+chunk_size: 256
+local_cpu: True
+max_local_cpu_size: 10
+cache_policy: "DRRIP"
+
+# DRRIP-specific configurations (all optional, defaults shown)
+drrip_max_rrpv: 3                    # Maximum RRPV value (default: 3)
+drrip_brrip_short_insert_prob: 32    # 1/32 chance for BRRIP short insert (default: 32)
+drrip_psel_max: 1023                 # Policy selector maximum (default: 1023)
+drrip_leader_set_mask: 0x1F          # Leader set mask in hex (default: 0x1F)
+

@@ -81,6 +81,7 @@ lmcache/experimental/tests
 
 # benchmark results
 *.csv
+/tmp
 
 # disk cache
 /remote_disk

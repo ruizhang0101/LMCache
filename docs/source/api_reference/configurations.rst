@@ -66,7 +66,22 @@ Basic cache settings that control the core functionality of LMCache.
      - Whether to enable Python garbage collection. Values: true/false. Default: true
    * - cache_policy
      - LMCACHE_CACHE_POLICY
-     - Cache eviction policy (e.g. "LRU", "LFU", "FIFO"). Default: "LRU"
+     - Cache eviction policy (e.g. "LRU", "LFU", "FIFO", "DRRIP"). Default: "LRU"
+   * - drrip_max_rrpv
+     - LMCACHE_DRRIP_MAX_RRPV
+     - Maximum Re-Reference Prediction Value for DRRIP policy. Default: 3
+   * - drrip_brrip_short_insert_prob
+     - LMCACHE_DRRIP_BRRIP_SHORT_INSERT_PROB
+     - Probability denominator for BRRIP short insert (1/N chance). Default: 32
+   * - drrip_srrip_insert_rrpv
+     - LMCACHE_DRRIP_SRRIP_INSERT_RRPV
+     - Insert RRPV value for SRRIP in DRRIP. Default: 2
+   * - drrip_psel_max
+     - LMCACHE_DRRIP_PSEL_MAX
+     - Maximum value for policy selector counter in DRRIP. Default: 1023
+   * - drrip_leader_set_mask
+     - LMCACHE_DRRIP_LEADER_SET_MASK
+     - Bit mask for leader set selection in DRRIP (hex format, e.g., 0x1F). Default: 0x1F
    * - numa_mode
      - LMCACHE_NUMA_MODE
      - NUMA-aware memory allocation mode. Values: "auto" (detect from system), "manual" (use extra_config mapping), null (disabled). When enabled, allocates pinned memory on specific NUMA nodes for better GPU-CPU memory bandwidth. Default: null

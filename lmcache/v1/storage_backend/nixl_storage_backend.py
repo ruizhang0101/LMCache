@@ -359,7 +359,7 @@ class NixlStorageBackend(AllocatorBackendInterface):
 
         self.loop = loop
         self.key_lock = threading.RLock()
-        self.cache_policy = get_cache_policy(config.cache_policy)
+        self.cache_policy = get_cache_policy(config.cache_policy, config)
         self.key_dict = self.cache_policy.init_mutable_mapping()
 
         self.progress_lock = threading.RLock()

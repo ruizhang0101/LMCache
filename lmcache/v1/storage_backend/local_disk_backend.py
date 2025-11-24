@@ -106,7 +106,7 @@ class LocalDiskBackend(StorageBackendInterface):
         else:
             super().__init__("cpu")
 
-        self.cache_policy = get_cache_policy(config.cache_policy)
+        self.cache_policy = get_cache_policy(config.cache_policy, config)
         self.dict = self.cache_policy.init_mutable_mapping()
 
         self.dst_device = dst_device
