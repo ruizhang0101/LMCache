@@ -5,7 +5,7 @@ L2 cache usage and enforces per-``cache_salt`` byte quotas via LRU eviction.
 MP servers **report store/lookup events** to the coordinator; the coordinator
 aggregates usage, manages quotas, and periodically selects LRU keys to evict
 when a tenant exceeds its quota. It is **opt-in** (gated by
-``l2_event_reporting`` in ``CoordinatorConfig``) and **additive** (the existing
+``event_reporting`` in ``CoordinatorConfig``, shared with the key-directory stream) and **additive** (the existing
 per-server eviction is unchanged).
 
 Code: `lmcache/v1/mp_coordinator/cache_control/` (coordinator side),
@@ -29,15 +29,17 @@ MP server (store/lookup)
   L2 adapter fires on_l2_keys_stored / on_l2_keys_accessed
         │
         ▼
-  L2EventListener (L2AdapterListener)
-    converts ObjectKey → EncodedObjectKey, buffers UsageEvents
-        │  flush every l2_event_flush_interval (default 1s)
+  L2DirectoryListener → CacheEventEmitter (see cache_events.md)
+    converts ObjectKey → EncodedObjectKey, buffers CacheEventBatches
+        │  flush every event_flush_interval (default 1s)
         │
         ▼
-  POST /quota/events ──▶ Coordinator
-                        ├─ L2UsageManager: per-salt byte accounting
-                        ├─ L2EvictionManager: per-salt LRU
-                        └─ QuotaManager: per-salt byte limits
+  POST /directory/events ──▶ Coordinator
+                        ├─ KeyDirectory: seq dedup / fencing, placements
+                        └─ CacheEventRouter (applied L2 batches only):
+                           ├─ L2UsageManager: per-salt byte accounting
+                           ├─ L2EvictionManager: per-salt LRU
+                           └─ QuotaManager: per-salt byte limits
 
   Coordinator background loop (every eviction_check_interval, default 5s)
         │
@@ -55,14 +57,13 @@ MP server (store/lookup)
   ``lmcache.v1.distributed.api``); ``chunk_hash`` is hex-encoded instead of raw
   bytes. The coordinator rebuilds the canonical ``ObjectKey`` via
   ``key.to_object_key()``.
-- **``EventType``** — ``str`` enum: ``STORE``, ``LOOKUP``, ``DELETE``.
-- **``UsageEvent``** — ``type: EventType``, ``key: EncodedObjectKey``,
-  ``bytes: int``.
-- **``ReportUsageRequest``** — ``instance_id``, ``seq``, ``events:
-  list[UsageEvent]``, ``tier`` (data, default ``l2``).
+- **``CacheEventBatch`` / ``CacheEventEntry`` / ``CacheEventType``**
+  (``mp_coordinator/api.py``) — the fleet cache-event vocabulary shared
+  with the key directory; ``STORE`` carries ``size_bytes``, L2 lookups
+  arrive as ``ACCESS``.
 
 The ``ObjectKey`` → ``EncodedObjectKey`` conversion happens at the MP-server
-boundary (``obj.to_encoded_object_key()`` in ``event_listener.py``), so the
+boundary (``obj.to_encoded_object_key()`` in ``cache_events.py``), so the
 coordinator never imports ``torch``.
 
 ## Coordinator components (`cache_control/`)
@@ -140,7 +141,11 @@ accounting lives in ``L2UsageManager``; the eviction manager only tracks order.
 | ``DELETE`` | ``/quota/{cache_salt}`` | Remove quota |
 | ``GET`` | ``/quota/{cache_salt}`` | Quota + usage for one salt |
 | ``GET`` | ``/quota`` | Quota + usage for all salts |
-| ``POST`` | ``/quota/events`` | Ingest batch of store/lookup/delete events |
+
+Event ingestion happens on ``POST /directory/events`` (the fleet
+cache-event stream); the ``CacheEventRouter`` fans directory-applied
+``l2`` batches into the usage/eviction consumers, so replayed batches
+cannot double-count.
 
 The ``/quota/config`` routes are declared before ``/quota/{cache_salt}`` so the
 literal ``config`` segment is not captured as a salt. Expected controller flow
@@ -154,22 +159,15 @@ left on the coordinator's ``/cache/*`` surface (``cache_api.py``). Paths are
 tier-neutral; the tier is request data (`tier`, default `l2`). Status responses
 report usage in GiB only (no raw bytes in the API).
 
-## MP-server event listener (`event_listener.py`)
+## MP-server event emission (`cache_events.py`)
 
-``L2EventListener`` implements ``L2AdapterListener`` and is registered
-on all L2 adapters via ``StorageManager.register_l2_listener()``. It:
-
-1. Receives ``on_l2_keys_stored(keys, sizes)``, ``on_l2_keys_accessed(keys)``,
-   and ``on_l2_keys_deleted(keys)`` callbacks from the L2 adapter (any thread).
-2. Converts each ``ObjectKey`` to ``EncodedObjectKey`` (hex-encodes
-   ``chunk_hash``).
-3. Buffers ``UsageEvent``s under a lock.
-4. Flushes the buffer to ``POST /quota/events`` on a timer
-   (``l2_event_flush_interval``, default 1s). Failures are logged and the
-   batch is dropped to prevent unbounded growth.
-
-``on_l2_keys_deleted`` buffers a ``DELETE`` event so the coordinator can drop
-the key from its usage accounting and LRU tracking.
+One ``L2DirectoryListener`` per adapter feeds the shared
+``CacheEventEmitter``, which flushes ordered batches to
+``POST /directory/events`` on a timer (``event_flush_interval``, default
+1s); failures drop the batch (the resulting seq gap flags resync). See
+[cache_events.md](cache_events.md) for the emitter/transport design.
+``on_l2_keys_deleted`` becomes a ``DELETE`` event so the coordinator can
+drop the key from its usage accounting and LRU tracking.
 
 ## Configuration
 
@@ -185,11 +183,11 @@ the key from its usage accounting and LRU tracking.
 
 | Field | Default | Env var | Description |
 | --- | --- | --- | --- |
-| ``l2_event_reporting`` | ``False`` | ``LMCACHE_COORDINATOR_L2_EVENT_REPORTING`` | Enable event reporting |
-| ``l2_event_flush_interval`` | ``1.0`` | ``LMCACHE_COORDINATOR_L2_EVENT_FLUSH_INTERVAL`` | Seconds between flushes |
+| ``event_reporting`` | ``False`` | ``LMCACHE_COORDINATOR_EVENT_REPORTING`` | Enable event reporting (also gates the key-directory stream) |
+| ``event_flush_interval`` | ``1.0`` | ``LMCACHE_COORDINATOR_EVENT_FLUSH_INTERVAL`` | Seconds between flushes |
 
-Both also accept CLI flags (``--coordinator-l2-event-reporting``,
-``--coordinator-l2-event-flush-interval``).
+Both also accept CLI flags (``--coordinator-event-reporting``,
+``--coordinator-event-flush-interval``).
 
 ## Failure modes
 

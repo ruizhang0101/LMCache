@@ -17,6 +17,7 @@ import httpx
 
 # First Party
 from lmcache.v1.distributed.quota_manager import QuotaManager
+from lmcache.v1.mp_coordinator.cache_control.event_router import CacheEventRouter
 from lmcache.v1.mp_coordinator.cache_control.eviction_manager import L2EvictionManager
 from lmcache.v1.mp_coordinator.cache_control.prefetch_manager import PrefetchManager
 from lmcache.v1.mp_coordinator.cache_control.usage_manager import L2UsageManager
@@ -40,6 +41,8 @@ class CoordinatorContext:
             (configured to match the fleet's ``chunk_size`` / ``hash_algorithm``).
         key_directory: Fleet-wide key → placements directory built from
             MP-server cache events (eventually consistent).
+        event_router: Fans directory-applied cache-event batches out to
+            the usage/eviction consumers.
         outbound_client: Shared async client for coordinator -> MP calls. Set by
             the lifespan (bound to the running loop); ``None`` until then.
     """
@@ -51,6 +54,7 @@ class CoordinatorContext:
     prefetch_manager: PrefetchManager
     token_hasher: TokenHasher
     key_directory: KeyDirectory
+    event_router: CacheEventRouter
     outbound_client: httpx.AsyncClient | None = None
 
 

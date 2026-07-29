@@ -551,6 +551,7 @@ class L1Manager:
         """
         ret: dict[ObjectKey, L1Error] = {}
         successful_keys: list[ObjectKey] = []
+        successful_sizes: list[int] = []
 
         for key in keys:
             entry = self._objects.get(key, None)
@@ -579,9 +580,10 @@ class L1Manager:
             entry.write_lock.unlock()
             ret[key] = L1Error.SUCCESS
             successful_keys.append(key)
+            successful_sizes.append(entry.memory_obj.get_size())
 
         for listener in self._registered_listeners:
-            listener.on_l1_keys_write_finished(successful_keys)
+            listener.on_l1_keys_write_finished(successful_keys, successful_sizes)
         self._event_bus.publish(
             Event(
                 event_type=EventType.L1_WRITE_FINISHED,
@@ -623,6 +625,7 @@ class L1Manager:
         total = 1 + extra_count
         ret: dict[ObjectKey, L1OperationResult] = {}
         successful_keys: list[ObjectKey] = []
+        successful_sizes: list[int] = []
 
         for key in keys:
             entry = self._objects.get(key, None)
@@ -652,9 +655,12 @@ class L1Manager:
                 entry.read_lock.lock()
             ret[key] = (L1Error.SUCCESS, entry.memory_obj)
             successful_keys.append(key)
+            successful_sizes.append(entry.memory_obj.get_size())
 
         for listener in self._registered_listeners:
-            listener.on_l1_keys_finish_write_and_reserve_read(successful_keys)
+            listener.on_l1_keys_finish_write_and_reserve_read(
+                successful_keys, successful_sizes
+            )
         self._event_bus.publish(
             Event(
                 event_type=EventType.L1_WRITE_FINISHED_AND_READ_RESERVED,

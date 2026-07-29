@@ -60,7 +60,7 @@ def _store(
 ) -> None:
     """Helper: record the bytes against the usage ledger and register
     the key in the eviction LRU — the two calls that the production
-    ``/quota/events`` handler issues for a single store event."""
+    event router issues for a single store event."""
     ut.record_stored(key, size)
     ctrl.on_store(key)
 
@@ -72,7 +72,7 @@ def _remove(
 ) -> None:
     """Helper: subtract the key's bytes from the usage ledger and
     drop it from the eviction LRU — the two calls that the production
-    ``/quota/events`` handler issues for a single delete event."""
+    event router issues for a single delete event."""
     ut.record_evicted(key)
     ctrl.on_remove(key)
 
@@ -313,7 +313,7 @@ def _instance(instance_id: str, ip: str = "10.0.0.1", port: int = 8000) -> MPIns
 async def test_execute_evictions_dispatches_to_registered_instance():
     """Computed plan must DELETE /cache/objects to a registered MP server with
     the right body shape. The LRU is NOT cleared by ``execute_evictions``
-    itself — that happens later via the coordinator's ``/quota/events``
+    itself — that happens later via the coordinator's cache-event stream
     handler when the MP server reports the deletion back."""
     ctrl, qs, ut = _setup(eviction_ratio=1.0)
     k = _make_key("alice", h="aa")
@@ -357,7 +357,7 @@ async def test_execute_evictions_dispatches_to_registered_instance():
     }
     # LRU + usage are UNCHANGED at this point — the DELETE event hasn't
     # arrived yet. Cleanup happens once the MP server flushes its
-    # ``on_l2_keys_deleted`` events back through ``/quota/events``.
+    # ``on_l2_keys_deleted`` events back through the cache-event stream.
     assert ctrl.compute_eviction_plan() == {"alice": [k]}
     assert ut.get("alice") == 100
 

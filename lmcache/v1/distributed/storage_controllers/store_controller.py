@@ -118,7 +118,9 @@ class StoreListener(L1ManagerListener):
 
     # L1ManagerListener implementation
 
-    def on_l1_keys_write_finished(self, keys: list[ObjectKey]) -> None:
+    def on_l1_keys_write_finished(
+        self, keys: list[ObjectKey], sizes: list[int]
+    ) -> None:
         """
         Enqueue keys and signal the notifier.
 
@@ -127,6 +129,8 @@ class StoreListener(L1ManagerListener):
 
         Args:
             keys (list[ObjectKey]): Keys that finished writing.
+            sizes (list[int]): The logical byte size of each written object
+                (unused here).
         """
         with self._lock:
             self._pending_keys.extend(keys)
@@ -144,7 +148,9 @@ class StoreListener(L1ManagerListener):
     def on_l1_keys_deleted_by_manager(self, keys: list[ObjectKey]) -> None:
         pass
 
-    def on_l1_keys_finish_write_and_reserve_read(self, keys: list[ObjectKey]) -> None:
+    def on_l1_keys_finish_write_and_reserve_read(
+        self, keys: list[ObjectKey], sizes: list[int]
+    ) -> None:
         # No op here because we don't want to trigger store when the
         # objects are prefetched to L1.
         pass

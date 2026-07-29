@@ -4,7 +4,8 @@
 Periodically compares per-salt usage against ``watermark * quota``;
 when over threshold, dispatches a ``DELETE /cache/objects`` to one registered MP
 server. LRU bookkeeping is updated when the corresponding ``delete``
-event arrives back via ``POST /quota/events``.
+event arrives back on the fleet cache-event stream
+(``POST /directory/events``).
 """
 
 # Future
@@ -187,8 +188,8 @@ class L2EvictionManager:
 
         Returns the scheduled plan as soon as the background dispatch
         tasks are spawned. The LRU is not cleared here — that happens
-        when the corresponding ``delete`` event arrives at
-        ``POST /quota/events``. At-least-once semantics; safe because the
+        when the corresponding ``delete`` event arrives on the fleet
+        cache-event stream. At-least-once semantics; safe because the
         underlying delete is idempotent.
         """
         plan = self.compute_eviction_plan()

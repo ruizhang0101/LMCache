@@ -31,6 +31,7 @@ import httpx
 from lmcache.logging import init_logger
 from lmcache.v1.distributed.quota_manager import QuotaManager
 from lmcache.v1.mp_coordinator.blend_directory import GlobalBlendMatcher
+from lmcache.v1.mp_coordinator.cache_control.event_router import CacheEventRouter
 from lmcache.v1.mp_coordinator.cache_control.eviction_manager import (
     L2EvictionManager,
 )
@@ -101,6 +102,10 @@ def create_app(config: MPCoordinatorConfig) -> FastAPI:
         chunk_size=config.chunk_size, probe_stride=config.blend_probe_stride
     )
     key_directory = KeyDirectory()
+    event_router = CacheEventRouter(
+        usage_manager=usage_manager,
+        eviction_manager=eviction_manager,
+    )
     # Typed context the cache handlers resolve via ``get_context``;
     # ``outbound_client`` is filled in by the lifespan (bound to the loop).
     ctx = CoordinatorContext(
@@ -111,6 +116,7 @@ def create_app(config: MPCoordinatorConfig) -> FastAPI:
         prefetch_manager=prefetch_manager,
         token_hasher=token_hasher,
         key_directory=key_directory,
+        event_router=event_router,
     )
 
     async def _health_loop() -> None:

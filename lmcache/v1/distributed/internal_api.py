@@ -64,17 +64,20 @@ class L1ManagerListener(EventListener):
         pass
 
     @abstractmethod
-    def on_l1_keys_write_finished(self, keys: list[ObjectKey]):
+    def on_l1_keys_write_finished(self, keys: list[ObjectKey], sizes: list[int]):
         """
         Notify the listener that keys have been finished for writing on L1.
 
         Args:
             keys (list[ObjectKey]): The keys that have been successfully written
+            sizes (list[int]): The logical byte size of each written object
         """
         pass
 
     @abstractmethod
-    def on_l1_keys_finish_write_and_reserve_read(self, keys: list[ObjectKey]):
+    def on_l1_keys_finish_write_and_reserve_read(
+        self, keys: list[ObjectKey], sizes: list[int]
+    ):
         """
         Notify the listener that keys have been finished for writing
         and reserved for read on L1.
@@ -84,6 +87,7 @@ class L1ManagerListener(EventListener):
         Args:
             keys (list[ObjectKey]): The keys that have been successfully
                 finished for writing and reserved for read
+            sizes (list[int]): The logical byte size of each written object
         """
         # NOTE (ApostaC): may consider renaming this to `on_l1_keys_finish_prefetch`
         # for better clarity

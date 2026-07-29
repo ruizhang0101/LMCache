@@ -181,7 +181,7 @@ class TestStoreListener:
         listener = StoreListener()
         keys = [make_object_key(i) for i in range(3)]
 
-        listener.on_l1_keys_write_finished(keys)
+        listener.on_l1_keys_write_finished(keys, [64] * len(keys))
         popped = listener.pop_pending_keys()
 
         assert popped == keys
@@ -190,7 +190,7 @@ class TestStoreListener:
     def test_pop_pending_keys_clears_queue(self):
         """pop_pending_keys should drain the queue."""
         listener = StoreListener()
-        listener.on_l1_keys_write_finished([make_object_key(0)])
+        listener.on_l1_keys_write_finished([make_object_key(0)], [64])
         listener.pop_pending_keys()
 
         assert listener.pop_pending_keys() == []
@@ -203,7 +203,7 @@ class TestStoreListener:
         poller = select.poll()
         poller.register(efd, select.POLLIN)
 
-        listener.on_l1_keys_write_finished([make_object_key(0)])
+        listener.on_l1_keys_write_finished([make_object_key(0)], [64])
 
         events = poller.poll(1000)
         assert len(events) > 0
@@ -212,8 +212,10 @@ class TestStoreListener:
     def test_multiple_writes_accumulate(self):
         """Multiple on_l1_keys_write_finished calls should accumulate keys."""
         listener = StoreListener()
-        listener.on_l1_keys_write_finished([make_object_key(0)])
-        listener.on_l1_keys_write_finished([make_object_key(1), make_object_key(2)])
+        listener.on_l1_keys_write_finished([make_object_key(0)], [64])
+        listener.on_l1_keys_write_finished(
+            [make_object_key(1), make_object_key(2)], [64, 64]
+        )
 
         popped = listener.pop_pending_keys()
         assert len(popped) == 3
@@ -224,7 +226,7 @@ class TestStoreListener:
         listener = StoreListener()
         keys = [make_object_key(i) for i in range(3)]
 
-        listener.on_l1_keys_finish_write_and_reserve_read(keys)
+        listener.on_l1_keys_finish_write_and_reserve_read(keys, [64] * len(keys))
 
         assert listener.pop_pending_keys() == []
         assert listener.pending_count() == 0
