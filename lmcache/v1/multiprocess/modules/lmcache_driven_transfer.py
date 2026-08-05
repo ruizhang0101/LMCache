@@ -61,6 +61,38 @@ _HAS_NATIVE_OBJECT_GROUP_TRANSFER: bool = hasattr(
 )
 
 
+def split_token_bindings(
+    token_ids: list[int], start: int, end: int, chunk_size: int
+) -> tuple[list[list[int]], list[int]]:
+    """Split a stored range into its complete chunks and their positions.
+
+    The positions are the store path's only output a consumer cannot
+    reconstruct: chunk hashes are prefix-chained, so a hash implies a
+    unique position but does not reveal it, and position-dependent reuse
+    (blend re-RoPE) needs the value.
+
+    Args:
+        token_ids: The request's full token ids.
+        start: First token position of the stored range; must be a
+            multiple of ``chunk_size`` for the offsets to line up with
+            the chunk hashes the storer computed.
+        end: One past the last token position of the stored range.
+        chunk_size: Tokens per chunk.
+
+    Returns:
+        ``(token_chunks, token_offsets)`` — parallel lists holding one
+        entry per **complete** chunk in ``[start, end)``, each chunk
+        paired with the absolute position of its first token. A trailing
+        partial chunk has no stored KV to bind to and is dropped, so both
+        lists are empty when the range holds no complete chunk.
+    """
+    effective_len = min(len(token_ids), end)
+    num_complete = effective_len - effective_len % chunk_size
+    token_offsets = list(range(start, num_complete, chunk_size))
+    token_chunks = [token_ids[offset : offset + chunk_size] for offset in token_offsets]
+    return token_chunks, token_offsets
+
+
 def get_layout_desc(
     cache_context: BaseCacheContext,
     num_tokens: int,
@@ -1364,23 +1396,23 @@ class LMCacheDrivenTransferModule(InstanceLivenessTarget):
         """Publish one ``MP_TOKENS`` event for ``key``'s chunks.
 
         Pairs each complete chunk in ``[key.start, key.end)`` with its
-        ObjectKey chunk hash. Must be called at store submission — before
-        the write-finished events can reach the bus — so the cache-event
-        subscriber can stamp token ids onto the STORE entries. A store
-        that later fails leaves only unused cache entries (bounded).
+        ObjectKey chunk hash and its token position. Must be called at
+        store submission — before the write-finished events can reach the
+        bus — so the cache-event subscriber can stamp token ids onto the
+        STORE entries. A store that later fails leaves only unused cache
+        entries (bounded).
+
+        The positions ride along because chunk hashes are prefix-chained:
+        the coordinator cannot derive where a chunk sat in the sequence,
+        and position-dependent reuse (blend re-RoPE) needs it.
 
         Args:
             key: The IPC key of the store being submitted.
             obj_keys: One ObjectKey per complete chunk, in chunk order.
         """
-        token_ids = list(key.token_ids)
-        chunk_size = self._ctx.chunk_size
-        effective_len = min(len(token_ids), key.end)
-        num_complete = effective_len - effective_len % chunk_size
-        token_chunks = [
-            token_ids[offset : offset + chunk_size]
-            for offset in range(key.start, num_complete, chunk_size)
-        ]
+        token_chunks, token_offsets = split_token_bindings(
+            list(key.token_ids), key.start, key.end, self._ctx.chunk_size
+        )
         if not token_chunks:
             return
         if len(obj_keys) != len(token_chunks):
@@ -1401,6 +1433,7 @@ class LMCacheDrivenTransferModule(InstanceLivenessTarget):
                 metadata={
                     "chunk_hashes": [obj_key.chunk_hash for obj_key in obj_keys],
                     "token_chunks": token_chunks,
+                    "token_offsets": token_offsets,
                 },
             )
         )

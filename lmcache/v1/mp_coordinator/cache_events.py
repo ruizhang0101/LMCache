@@ -116,6 +116,21 @@ class HttpCacheEventSink(CacheEventSink):
         self._client.close()
 
 
+@dataclass(frozen=True)
+class _ChunkTokens:
+    """One chunk's token content, as remembered between its token-binding
+    event and the store events that carry it to the directory.
+
+    Attributes:
+        token_ids: The chunk's token ids.
+        token_offset: Token position of the chunk's first token in the
+            sequence being stored.
+    """
+
+    token_ids: tuple[int, ...]
+    token_offset: int
+
+
 @dataclass
 class _PendingBatch:
     """A buffered batch-to-be: entries sharing one ``(event_type, tier,
@@ -166,10 +181,10 @@ class CacheEventSubscriber(EventSubscriber):
         # Consecutive same-identity entries append to the last pending
         # batch; an identity change starts a new one (order-preserving).
         self._pending_batches: list[_PendingBatch] = []
-        # Chunk hash → token ids from token-binding events (published
+        # Chunk hash → token content from token-binding events (published
         # ahead of the write-finished events), used to stamp STORE
         # entries. LRU-bounded; a miss stamps nothing.
-        self._token_bindings: OrderedDict[bytes, tuple[int, ...]] = OrderedDict()
+        self._token_bindings: OrderedDict[bytes, _ChunkTokens] = OrderedDict()
 
     def get_subscriptions(self) -> dict[EventType, EventCallback]:
         """Return the bus events this subscriber consumes."""
@@ -268,8 +283,13 @@ class CacheEventSubscriber(EventSubscriber):
     def _on_tokens(self, event: Event) -> None:
         chunk_hashes: list[bytes] = event.metadata["chunk_hashes"]
         token_chunks: list[list[int]] = event.metadata["token_chunks"]
-        for chunk_hash, chunk in zip(chunk_hashes, token_chunks, strict=True):
-            self._token_bindings[chunk_hash] = tuple(chunk)
+        token_offsets: list[int] = event.metadata["token_offsets"]
+        for chunk_hash, chunk, offset in zip(
+            chunk_hashes, token_chunks, token_offsets, strict=True
+        ):
+            self._token_bindings[chunk_hash] = _ChunkTokens(
+                token_ids=tuple(chunk), token_offset=offset
+            )
             self._token_bindings.move_to_end(chunk_hash)
         if len(self._token_bindings) <= _TOKEN_BINDING_CACHE_SIZE:
             return
@@ -324,12 +344,18 @@ class CacheEventSubscriber(EventSubscriber):
         )
 
     def _store_entry(self, key: ObjectKey, size_bytes: int) -> CacheEventEntry:
-        """Build a STORE entry, stamping the chunk's token ids when the
+        """Build a STORE entry, stamping the chunk's token content when the
         token-binding cache knows the chunk."""
+        binding = self._token_bindings.get(key.chunk_hash)
+        if binding is None:
+            return CacheEventEntry(
+                key=key.to_encoded_object_key(), size_bytes=size_bytes
+            )
         return CacheEventEntry(
             key=key.to_encoded_object_key(),
             size_bytes=size_bytes,
-            token_ids=list(self._token_bindings.get(key.chunk_hash, ())),
+            token_ids=list(binding.token_ids),
+            token_offset=binding.token_offset,
         )
 
     def _record(

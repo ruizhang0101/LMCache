@@ -17,6 +17,7 @@ import pytest
 from lmcache.v1.distributed.api import L1BackendType, ObjectKey, Tier
 from lmcache.v1.distributed.internal_api import L1ObjectMeta
 from lmcache.v1.mp_coordinator.api import (
+    UNKNOWN_TOKEN_OFFSET,
     CacheEventBatch,
     CacheEventEntry,
     CacheEventType,
@@ -156,6 +157,7 @@ def test_tokens_stored_events_publish_no_batches():
             metadata={
                 "chunk_hashes": [_key(1).chunk_hash],
                 "token_chunks": [[1, 2]],
+                "token_offsets": [0],
             },
         ),
     )
@@ -179,6 +181,7 @@ def test_tokens_event_stamps_store_entries():
             metadata={
                 "chunk_hashes": [_key(1).chunk_hash],
                 "token_chunks": [[1, 2]],
+                "token_offsets": [0],
             },
         ),
         Event(
@@ -206,6 +209,41 @@ def test_tokens_event_stamps_store_entries():
     assert l2_store.entries[0].token_ids == [1, 2]
     # Deletes never carry tokens.
     assert delete.entries[0].token_ids == []
+    # The chunk's position rides with its tokens, on every stamped entry.
+    # The third key's chunk is unknown to the binding cache, so it carries no
+    # position rather than claiming 0.
+    assert [e.token_offset for e in l1_store.entries] == [0, 0, UNKNOWN_TOKEN_OFFSET]
+    assert l2_store.entries[0].token_offset == 0
+
+
+def test_tokens_event_stamps_the_chunks_offset():
+    """Each chunk carries its own position, so a mid-sequence chunk is
+    stamped with its offset rather than the batch's first."""
+    sink = _RecordingSink()
+    subscriber = _subscriber(sink)
+
+    keys = [_key(1), _key(2)]
+    _dispatch(
+        subscriber,
+        Event(
+            event_type=EventType.MP_TOKENS,
+            metadata={
+                "chunk_hashes": [key.chunk_hash for key in keys],
+                "token_chunks": [[1, 2], [3, 4]],
+                "token_offsets": [256, 512],
+            },
+        ),
+        Event(
+            event_type=EventType.L1_WRITE_FINISHED,
+            metadata={"keys": keys, "meta": [_meta(100)] * 2},
+        ),
+    )
+    subscriber.flush()
+
+    [batches] = sink.published
+    store = batches[-1]
+    assert [e.token_ids for e in store.entries] == [[1, 2], [3, 4]]
+    assert [e.token_offset for e in store.entries] == [256, 512]
 
 
 def test_token_binding_cache_evicts_oldest_down_to_half(monkeypatch):
@@ -228,6 +266,7 @@ def test_token_binding_cache_evicts_oldest_down_to_half(monkeypatch):
             metadata={
                 "chunk_hashes": [key.chunk_hash for key in keys],
                 "token_chunks": [[1, 2], [3, 4], [5, 6]],
+                "token_offsets": [0, 256, 512],
             },
         ),
         Event(
@@ -268,6 +307,7 @@ def test_token_binding_eviction_warns(monkeypatch):
             metadata={
                 "chunk_hashes": [_key(i).chunk_hash for i in (1, 2, 3)],
                 "token_chunks": [[1, 2], [3, 4], [5, 6]],
+                "token_offsets": [0, 256, 512],
             },
         ),
     )
@@ -288,6 +328,25 @@ def test_mismatched_token_chunks_raise():
                 metadata={
                     "chunk_hashes": [_key(1).chunk_hash, _key(2).chunk_hash],
                     "token_chunks": [[1, 2]],
+                    "token_offsets": [0, 256],
+                },
+            ),
+        )
+
+
+def test_mismatched_token_offsets_raise():
+    """Offsets are parallel to the chunks by construction, so a length
+    mismatch is a publisher bug, not a degraded binding."""
+    subscriber = _subscriber(_RecordingSink())
+    with pytest.raises(ValueError):
+        _dispatch(
+            subscriber,
+            Event(
+                event_type=EventType.MP_TOKENS,
+                metadata={
+                    "chunk_hashes": [_key(1).chunk_hash, _key(2).chunk_hash],
+                    "token_chunks": [[1, 2], [3, 4]],
+                    "token_offsets": [0],
                 },
             ),
         )
@@ -709,6 +768,7 @@ def test_token_bindings_feed_the_key_directory_end_to_end():
             metadata={
                 "chunk_hashes": [_key(1).chunk_hash, _key(2).chunk_hash],
                 "token_chunks": [[1, 2], [3, 4]],
+                "token_offsets": [0, 256],
             },
         ),
         Event(
@@ -719,10 +779,12 @@ def test_token_bindings_feed_the_key_directory_end_to_end():
     subscriber.flush()
 
     key_directory = app.state.ctx.key_directory
-    assert key_directory.get_token_ids([_key(1).chunk_hash, _key(2).chunk_hash]) == [
-        (1, 2),
-        (3, 4),
-    ]
+    bindings = key_directory.get_token_bindings(
+        [_key(1).chunk_hash, _key(2).chunk_hash]
+    )
+    assert [b.token_ids.tolist() for b in bindings] == [[1, 2], [3, 4]]
+    # The offsets survive the emitter -> HTTP -> directory round trip.
+    assert [b.token_offset for b in bindings] == [0, 256]
 
 
 def test_http_sink_raises_publish_error_on_http_failure():

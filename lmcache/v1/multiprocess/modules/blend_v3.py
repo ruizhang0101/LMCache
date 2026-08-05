@@ -1264,29 +1264,28 @@ class BlendV3Module(InstanceLivenessTarget):
             prefix_handle, prefix_ws = self._submit_prefix_leg(
                 key, tp_size, prefix_policy
             )
-            # Local and coordinator matching are mutually exclusive: with a
-            # coordinator the fleet directory is the only source, so skip the
-            # local matcher (and its span). The coordinator leg is async
-            # (submitted below, resolved at poll) and is timed by cb.lookup.
-            matches: list[CBMatchResult]
-            if self._coordinator is not None:
-                matches = []
-            else:
-                # Local fingerprint match: CPU-bound, tight span.
-                self._event_bus.publish(
-                    Event(
-                        event_type=EventType.CB_FINGERPRINT_MATCH_START,
-                        session_id=rid,
-                    )
+            # The local matcher always runs; a coordinator only *adds* fleet
+            # matches (merged at poll below). The fleet directory is not a
+            # guaranteed superset of the local table -- it is fed by
+            # best-effort cache events, so a dropped batch or an evicted
+            # emitter token binding leaves a chunk this server holds
+            # unmatchable fleet-wide. Union recall >= either source alone, and
+            # the overlap dedup already collapses chunks both report.
+            # Local fingerprint match: CPU-bound, tight span.
+            self._event_bus.publish(
+                Event(
+                    event_type=EventType.CB_FINGERPRINT_MATCH_START,
+                    session_id=rid,
                 )
-                matches = self._match_fingerprints(key)
-                self._event_bus.publish(
-                    Event(
-                        event_type=EventType.CB_FINGERPRINT_MATCH_END,
-                        session_id=rid,
-                        metadata={"matches": len(matches)},
-                    )
+            )
+            matches = self._match_fingerprints(key)
+            self._event_bus.publish(
+                Event(
+                    event_type=EventType.CB_FINGERPRINT_MATCH_END,
+                    session_id=rid,
+                    metadata={"matches": len(matches)},
                 )
+            )
             job = _CBUnifiedJob(
                 matches=matches,
                 num_tokens=len(key.token_ids),
@@ -1326,12 +1325,14 @@ class BlendV3Module(InstanceLivenessTarget):
         # enter the sparse prefetch, so they cannot leak a read lock.
         if not job.sparse_started:
             prefix_tokens = prefix_chunks * chunk_size
+            candidates = job.matches
             if self._coordinator is not None:
-                candidates = self._poll_coordinator_match(job, rid)
-                if candidates is None:
+                fleet = self._poll_coordinator_match(job, rid)
+                if fleet is None:
                     return None  # coordinator still in flight (bounded by deadline)
-            else:
-                candidates = job.matches
+                # Union of both sources; _non_overlapping_after_prefix takes
+                # candidates in any order and collapses duplicates by overlap.
+                candidates = candidates + fleet
             # Under SEGMENTED_PREFIX, a same-position match the prefix leg already
             # retained rides the segmented tail (prefix-class: pure load, no CHECK)
             # -- drop it here so it is not scattered twice. A same-position match
@@ -1537,48 +1538,7 @@ class BlendV3Module(InstanceLivenessTarget):
                 key.request_id,
             )
 
-        if self._coordinator is not None:
-            self._publish_fingerprints(key, chunk_hashes, tokens_in_range)
-
         return result
-
-    def _publish_fingerprints(
-        self,
-        key: IPCCacheServerKey,
-        chunk_hashes: list[bytes],
-        tokens_in_range: list[int],
-    ) -> None:
-        """Publish this stored range's chunk fingerprints to the coordinator.
-
-        Best-effort and fire-and-forget (enqueue only): one wire
-        ``ChunkFingerprint`` per stored chunk -- its content poly-hash (the same
-        ``chunk_hash_windows_numba`` the match probes, with the fleet base), its
-        shared-L2 ``object_key`` (the chunk storage key ``th``), and its token
-        position. Never raises into the store path.
-
-        Args:
-            key: The store request key (model/scope/positions).
-            chunk_hashes: Per-chunk storage keys (``th``) for the range.
-            tokens_in_range: The stored tokens ``token_ids[start:end]``.
-        """
-        coordinator = self._coordinator
-        if coordinator is None or not chunk_hashes:
-            return
-        try:
-            model_scope = key.model_name
-            store_range = {
-                "model_scope": model_scope,
-                "tokens": list(tokens_in_range),
-                "object_keys": [h.hex() for h in chunk_hashes],
-                "old_st_base": key.start,
-            }
-            coordinator.enqueue_register([store_range])
-        except Exception:
-            logger.warning(
-                "CB coordinator publish build failed for request %s "
-                "(does not affect store correctness)",
-                key.request_id,
-            )
 
     def _submit_coordinator_match(self, key: IPCCacheServerKey) -> bool:
         """Issue a fleet directory match query for this request (best-effort).
@@ -1597,7 +1557,7 @@ class BlendV3Module(InstanceLivenessTarget):
             tokens = list(key.token_ids)
             if len(tokens) < self._ctx.chunk_size:
                 return False
-            coordinator.submit_match(key.request_id, key.model_name, tokens)
+            coordinator.submit_match(key.request_id, tokens)
             return True
         except Exception:
             logger.warning(
@@ -1659,11 +1619,14 @@ class BlendV3Module(InstanceLivenessTarget):
     ) -> list[CBMatchResult]:
         """Convert coordinator matches into chunk-granular retrievable segments.
 
-        Each coordinator ``object_key`` is the hex of the chunk's content hash
+        Each coordinator ``chunk_hash`` is the hex of the chunk's content hash
         (the same ``th`` a local ``CBMatchResult.hash`` holds), so the matches
         are returned as ``CBMatchResult`` directly: the retrieve path then
-        expands ``hash`` to per-rank shared-L2 object keys via
-        ``ipc_key_to_object_keys``, identical to local matches.
+        expands ``hash`` to per-rank object keys via
+        ``ipc_key_to_object_keys`` using *this* server's model, salt, and world
+        size, identical to local matches. A match on content another model or
+        tenant stored therefore confirmed-misses at prefetch rather than being
+        filtered coordinator-side.
 
         Args:
             matches: Matched chunks returned by the coordinator client.
@@ -1678,7 +1641,7 @@ class BlendV3Module(InstanceLivenessTarget):
                 old_ed=m.old_st + chunk_size,
                 cur_st=m.cur_st,
                 cur_ed=m.cur_st + chunk_size,
-                hash=bytes.fromhex(m.object_key),
+                hash=bytes.fromhex(m.chunk_hash),
             )
             for m in matches
         ]

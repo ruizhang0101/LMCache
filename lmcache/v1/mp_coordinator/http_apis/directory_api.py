@@ -18,6 +18,9 @@ from lmcache.v1.distributed.api import Tier
 from lmcache.v1.mp_coordinator.http_apis.dependencies import get_context
 from lmcache.v1.mp_coordinator.key_directory import ApplyResult, DirectoryStats
 from lmcache.v1.mp_coordinator.schemas import (
+    BlendLookupRequest,
+    BlendLookupResponse,
+    BlendMatchModel,
     DirectoryEventsRequest,
     DirectoryEventsResponse,
     DirectoryKeyInfo,
@@ -25,6 +28,7 @@ from lmcache.v1.mp_coordinator.schemas import (
     DirectoryListResponse,
     DirectoryLookupRequest,
     DirectoryLookupResponse,
+    decode_tokens,
 )
 from lmcache.v1.multiprocess.cache_control.key_resolver import resolve_object_keys
 
@@ -105,18 +109,63 @@ async def lookup_placements(
             raise HTTPException(status_code=400, detail=str(exc)) from exc
         encoded_keys = [key.to_encoded_object_key() for key in obj_keys]
     placements = ctx.key_directory.lookup(obj_keys)
-    token_ids = ctx.key_directory.get_token_ids([key.chunk_hash for key in obj_keys])
+    bindings = ctx.key_directory.get_token_bindings(
+        [key.chunk_hash for key in obj_keys]
+    )
     return DirectoryLookupResponse(
         chunks=chunks,
         results=[
             DirectoryKeyPlacements(
-                key=encoded, placements=key_placements, token_ids=list(tokens)
+                key=encoded,
+                placements=key_placements,
+                token_ids=binding.token_ids.tolist(),
+                token_offset=binding.token_offset,
             )
-            for encoded, key_placements, tokens in zip(
-                encoded_keys, placements, token_ids, strict=True
+            for encoded, key_placements, binding in zip(
+                encoded_keys, placements, bindings, strict=True
             )
         ],
     )
+
+
+@router.post("/directory/blend-lookup")
+async def blend_lookup(
+    body: BlendLookupRequest, request: Request
+) -> BlendLookupResponse:
+    """Find cached chunk content anywhere inside a query sequence.
+
+    The fragment counterpart to ``/directory/lookup``: the query is not
+    required to be a prefix, and each match reports where the content
+    sits in the query and where it sat when stored, so the caller can
+    re-RoPE it. Matches name a ``chunk_hash`` only — the caller expands
+    it into object keys with its own model, salt, and world size, so a
+    cross-model or cross-tenant match misses at retrieve.
+
+    Args:
+        body: The query tokens.
+        request: The FastAPI request carrying the coordinator context.
+
+    Returns:
+        Matched chunks, ascending by query position.
+    """
+    directory = get_context(request).key_directory
+    tokens = decode_tokens(body.tokens_b64)
+
+    def _match() -> BlendLookupResponse:
+        """Run the fragment match and shape it for the wire."""
+        return BlendLookupResponse(
+            matches=[
+                BlendMatchModel(
+                    chunk_hash=match.chunk_hash.hex(),
+                    old_st=match.old_st,
+                    cur_st=match.cur_st,
+                )
+                for match in directory.match_content(tokens)
+            ]
+        )
+
+    # The rolling hash walks the whole query — keep it off the event loop.
+    return await asyncio.to_thread(_match)
 
 
 @router.get("/directory/keys")
@@ -151,18 +200,19 @@ async def list_directory_keys(
     directory = get_context(request).key_directory
 
     def _scan() -> DirectoryListResponse:
+        """Page the directory and shape the rows for the wire."""
         total, page = directory.list_keys(tier, instance_id, backend, offset, limit)
-        token_ids = directory.get_token_ids([key.chunk_hash for key in page])
+        bindings = directory.get_token_bindings([key.chunk_hash for key in page])
         return DirectoryListResponse(
             total=total,
             keys=[
                 DirectoryKeyInfo(
                     key=key.to_encoded_object_key(),
                     placements=placements,
-                    num_tokens=len(tokens),
+                    num_tokens=int(binding.token_ids.size),
                 )
-                for (key, placements), tokens in zip(
-                    page.items(), token_ids, strict=True
+                for (key, placements), binding in zip(
+                    page.items(), bindings, strict=True
                 )
             ],
         )

@@ -24,16 +24,34 @@ from dataclasses import dataclass, field
 from enum import Enum
 import threading
 
+# Third Party
+import numpy as np
+
 # First Party
 from lmcache.logging import init_logger
 from lmcache.v1.distributed.api import ObjectKey, Tier
 from lmcache.v1.mp_coordinator.api import (
+    UNKNOWN_TOKEN_OFFSET,
     CacheEventBatch,
     CacheEventEntry,
     CacheEventType,
 )
+from lmcache.v1.mp_coordinator.content_index import (
+    ContentIndex,
+    ContentIndexStats,
+    ContentMatch,
+)
 
 logger = init_logger(__name__)
+
+# Token ids are held as ``uint32``: a few hundred bytes per chunk instead
+# of the ~10 KB a ``tuple[int, ...]`` of boxed ints costs, and content
+# comparison against a query window stays vectorized.
+_TOKEN_DTYPE = np.uint32
+
+# Shared read-only empty array for chunks whose content is unknown.
+_NO_TOKENS = np.empty(0, dtype=_TOKEN_DTYPE)
+_NO_TOKENS.flags.writeable = False
 
 
 @dataclass(frozen=True)
@@ -100,11 +118,14 @@ class DirectoryStats:
         num_keys: Keys with at least one placement.
         num_placements: Total placements across all keys.
         instances: Per-instance bookkeeping, keyed by ``instance_id``.
+        content: Content-index counts — how much of the directory is
+            fragment-matchable (see :class:`ContentIndexStats`).
     """
 
     num_keys: int
     num_placements: int
     instances: dict[str, InstanceDirectoryStats]
+    content: ContentIndexStats
 
 
 @dataclass
@@ -115,13 +136,32 @@ class _KeyRecord:
     last_access: float = 0.0
 
 
+@dataclass(frozen=True)
+class TokenBinding:
+    """One chunk's known token content, as returned by the directory.
+
+    Attributes:
+        token_ids: The chunk's token ids as a read-only ``uint32`` array;
+            empty when the directory does not know the chunk's content.
+        token_offset: Token position of the chunk's first token in the
+            sequence it was stored under, or
+            :data:`~lmcache.v1.mp_coordinator.api.UNKNOWN_TOKEN_OFFSET`
+            when no emitter has reported one (including for chunks whose
+            content is unknown).
+    """
+
+    token_ids: np.ndarray
+    token_offset: int
+
+
 @dataclass
 class _TokenBinding:
-    """Token ids for one chunk hash plus the keys sharing it (dropped
+    """Token content for one chunk hash plus the keys sharing it (dropped
     when the last key goes). ``token_ids`` is empty until a
     token-bearing ``STORE`` entry arrives."""
 
-    token_ids: tuple[int, ...]
+    token_ids: np.ndarray
+    token_offset: int
     keys: set[ObjectKey]
 
 
@@ -142,12 +182,26 @@ class KeyDirectory:
     reads through :meth:`lookup` and :meth:`stats`. Nothing is persisted.
     """
 
-    def __init__(self) -> None:
+    def __init__(self, chunk_size: int = 256, probe_stride: int = 1) -> None:
+        """Initialize an empty directory and its content index.
+
+        Args:
+            chunk_size: Fleet chunk size; the content index's match
+                window.
+            probe_stride: Query positions between content-index probes.
+
+        Raises:
+            ValueError: If ``chunk_size`` or ``probe_stride`` is < 1.
+        """
         self._lock = threading.Lock()
         self._records: dict[ObjectKey, _KeyRecord] = {}
         self._instances: dict[str, _InstanceState] = {}
         # chunk hash → tokens + keys, for chunk hashes of >= 1 record.
         self._token_bindings: dict[bytes, _TokenBinding] = {}
+        # Derived from the bindings; owns its own lock (order: self → index).
+        self._content_index = ContentIndex(
+            chunk_size=chunk_size, probe_stride=probe_stride
+        )
 
     def apply_batch(self, batch: CacheEventBatch) -> ApplyResult:
         """Apply one event batch to the directory.
@@ -220,22 +274,68 @@ class KeyDirectory:
                 )
             return results
 
-    def get_token_ids(self, chunk_hashes: list[bytes]) -> list[tuple[int, ...]]:
-        """Return the known token ids for each requested chunk hash.
+    def get_token_bindings(self, chunk_hashes: list[bytes]) -> list[TokenBinding]:
+        """Return the known token content for each requested chunk hash.
 
         Args:
             chunk_hashes: ``ObjectKey.chunk_hash`` values to look up.
 
         Returns:
-            One token-id tuple per hash, in request order — empty for
-            unknown chunks.
+            One binding per hash, in request order. Unknown chunks — and
+            chunks no token-bearing entry has arrived for — yield a
+            binding with empty ``token_ids``.
         """
         with self._lock:
-            results: list[tuple[int, ...]] = []
+            results: list[TokenBinding] = []
             for chunk_hash in chunk_hashes:
                 binding = self._token_bindings.get(chunk_hash)
-                results.append(binding.token_ids if binding is not None else ())
+                if binding is None:
+                    results.append(
+                        TokenBinding(
+                            token_ids=_NO_TOKENS,
+                            token_offset=UNKNOWN_TOKEN_OFFSET,
+                        )
+                    )
+                else:
+                    results.append(
+                        TokenBinding(
+                            token_ids=binding.token_ids,
+                            token_offset=binding.token_offset,
+                        )
+                    )
             return results
+
+    def match_content(self, tokens: np.ndarray) -> list[ContentMatch]:
+        """Find cached chunks contained anywhere in ``tokens``.
+
+        The fragment lookup behind fleet-wide CacheBlend reuse: unlike
+        :meth:`lookup`, the query need not be a prefix — each match is a
+        chunk of content found at some offset. Matches name a
+        ``chunk_hash`` only; the caller expands it into object keys with
+        its own model, salt, and world size, so a cross-model or
+        cross-tenant match misses at retrieve rather than being filtered
+        here.
+
+        Runs under the content index's lock, not the directory's, so it
+        does not serialize behind event application.
+
+        Args:
+            tokens: The query token ids.
+
+        Returns:
+            Matches in ascending ``cur_st`` order, at most one per chunk.
+            Matches may overlap in the query: callers that scatter them
+            must resolve overlaps themselves.
+        """
+        return self._content_index.match(tokens)
+
+    def content_stats(self) -> ContentIndexStats:
+        """Return a point-in-time summary of the content index.
+
+        Returns:
+            Distinct contents, total chunks, and the table size.
+        """
+        return self._content_index.stats()
 
     def list_keys(
         self,
@@ -326,9 +426,10 @@ class KeyDirectory:
         """Return a point-in-time summary of directory contents.
 
         Returns:
-            Key/placement counts plus per-instance stream state, keyed by
-            ``instance_id``.
+            Key/placement counts, per-instance stream state keyed by
+            ``instance_id``, and the content-index counts.
         """
+        content = self._content_index.stats()
         with self._lock:
             num_placements = sum(
                 len(record.placements) for record in self._records.values()
@@ -346,6 +447,7 @@ class KeyDirectory:
                 num_keys=len(self._records),
                 num_placements=num_placements,
                 instances=instances,
+                content=content,
             )
 
     # -- Internals (call with self._lock held) --------------------------------
@@ -378,7 +480,7 @@ class KeyDirectory:
             else:
                 record.placements[index] = placement
             if entry.token_ids:
-                self._token_bindings[key.chunk_hash].token_ids = tuple(entry.token_ids)
+                self._fill_binding_locked(key.chunk_hash, entry)
             record.last_access = max(record.last_access, batch.ts)
             if batch.tier == Tier.L1:
                 state.keys.add(key)
@@ -444,23 +546,64 @@ class KeyDirectory:
         state.keys.clear()
         return removed
 
+    def _fill_binding_locked(self, chunk_hash: bytes, entry: CacheEventEntry) -> None:
+        """Record ``entry``'s token content on ``chunk_hash``'s binding.
+
+        Token ids outside ``uint32`` leave the binding as it was — a
+        lookup miss, repaired by the chunk's next well-formed entry —
+        rather than failing the whole batch over one bad entry.
+
+        An entry whose ``token_offset`` is
+        :data:`~lmcache.v1.mp_coordinator.api.UNKNOWN_TOKEN_OFFSET` still
+        fills the binding's content (so ``key -> tokens`` introspection
+        works) but is **not** added to the content index: without the
+        stored position, a fragment match could not tell the requester
+        where to re-RoPE the chunk from, and a wrong position yields
+        wrong KV rather than a miss.
+
+        Args:
+            chunk_hash: Chunk hash whose binding to fill.
+            entry: The store entry carrying the token ids and offset.
+        """
+        try:
+            token_ids = np.asarray(entry.token_ids, dtype=_TOKEN_DTYPE)
+        except (OverflowError, TypeError, ValueError):
+            logger.warning(
+                "Ignoring token ids for chunk %s: values outside uint32",
+                chunk_hash.hex(),
+            )
+            return
+        token_ids.flags.writeable = False
+        binding = self._token_bindings[chunk_hash]
+        if binding.token_ids.size and not np.array_equal(binding.token_ids, token_ids):
+            # Re-store with different content: retire the old fingerprint,
+            # or the chunk stays discoverable under content it no longer has.
+            self._content_index.remove(binding.token_ids, chunk_hash)
+        binding.token_ids = token_ids
+        binding.token_offset = entry.token_offset
+        if entry.token_offset == UNKNOWN_TOKEN_OFFSET:
+            return
+        self._content_index.add(token_ids, chunk_hash, entry.token_offset)
+
     def _link_key(self, key: ObjectKey) -> None:
         """Index ``key`` under its chunk's token binding, creating an
         empty binding on first reference."""
         binding = self._token_bindings.get(key.chunk_hash)
         if binding is None:
             self._token_bindings[key.chunk_hash] = _TokenBinding(
-                token_ids=(), keys={key}
+                token_ids=_NO_TOKENS, token_offset=UNKNOWN_TOKEN_OFFSET, keys={key}
             )
         else:
             binding.keys.add(key)
 
     def _unlink_key(self, key: ObjectKey) -> None:
         """Remove ``key`` from its chunk's token binding, dropping the
-        binding with its last key."""
+        binding — and its content-index entry — with its last key."""
         binding = self._token_bindings.get(key.chunk_hash)
         if binding is None:
             return
         binding.keys.discard(key)
         if not binding.keys:
             del self._token_bindings[key.chunk_hash]
+            if binding.token_ids.size:
+                self._content_index.remove(binding.token_ids, key.chunk_hash)

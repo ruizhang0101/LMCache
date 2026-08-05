@@ -220,3 +220,26 @@ def test_deprecated_flags_log_warning():
 def test_deprecated_flush_interval_flag_rejects_nonpositive():
     with pytest.raises(ValueError):
         _parse(["--coordinator-l2-event-flush-interval", "0"])
+
+
+# -- Fleet CacheBlend gating -------------------------------------------------
+
+
+def test_fleet_blend_needs_both_url_and_event_reporting():
+    """Fleet matching queries an index built from the cache-event stream, so
+    a URL alone would query a coordinator with nothing to match against."""
+    both = _parse(
+        ["--coordinator-url", "http://coord:9300", "--coordinator-event-reporting"]
+    )
+    assert both.fleet_blend_url == "http://coord:9300"
+
+    url_only = _parse(["--coordinator-url", "http://coord:9300"])
+    assert url_only.url == "http://coord:9300"
+    assert url_only.event_reporting is False
+    assert url_only.fleet_blend_url == ""
+
+
+def test_fleet_blend_url_empty_without_a_coordinator():
+    reporting_only = _parse(["--coordinator-event-reporting"])
+    assert reporting_only.fleet_blend_url == ""
+    assert _parse([]).fleet_blend_url == ""

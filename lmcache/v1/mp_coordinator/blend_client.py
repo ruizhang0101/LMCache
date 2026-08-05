@@ -1,15 +1,20 @@
 # SPDX-License-Identifier: Apache-2.0
-"""Blend mp-server side client for the coordinator fingerprint directory.
+"""Blend mp-server side client for the coordinator's fragment lookup.
 
-The blend module runs in sync thread pools with no asyncio loop, so this client
-owns a synchronous ``httpx.Client`` plus a background daemon, mirroring the
-module's existing ``_fingerprint_queue`` worker. STORE publishes are best-effort
-and fire-and-forget; LOOKUP match queries follow the same non-blocking
-submit-once / poll-on-recall pattern the blend lookup already uses for its prefix
-and sparse legs (the handler never blocks a worker thread on the round-trip).
+Queries ``POST /directory/blend-lookup``: which cached chunks does this
+request contain, and where? The blend module runs in sync thread pools with no
+asyncio loop, so this client owns a synchronous ``httpx.Client`` plus a
+background daemon. Queries follow the same non-blocking submit-once /
+poll-on-recall pattern the blend lookup already uses for its prefix and sparse
+legs, so a handler never blocks a worker thread on the round-trip.
+
+**Query only.** The chunks the coordinator matches against arrive on the
+fleet cache-event stream (``mp.tokens`` + the L1/L2 store events, see
+``mp_coordinator/cache_events.py``), so there is no publish path here: the
+directory learns what this server stored from the events it already emits.
 
 It is **opt-in**: with no coordinator URL configured the blend module receives
-``None`` and every publish/query path is skipped, so behavior is unchanged.
+``None`` and every query is skipped, matching purely locally.
 """
 
 # Standard
@@ -35,26 +40,20 @@ _RequestFn = Callable[[str, str, dict], dict]
 
 @dataclass
 class RemoteMatch:
-    """One chunk matched in the fleet directory (see directory.GlobalMatch).
+    """One chunk matched in the fleet directory (see ``ContentMatch``).
 
     Attributes:
-        object_key: Shared-L2 storage key of the matched chunk.
+        chunk_hash: Hex of the matched chunk's content hash — the same
+            ``th`` a local ``CBMatchResult.hash`` holds, so the retrieve
+            path expands it with this server's own model, salt, and world
+            size.
         old_st: Token position in the stored sequence (re-RoPE source).
         cur_st: Token position in the request (re-RoPE target).
     """
 
-    object_key: str
+    chunk_hash: str
     old_st: int
     cur_st: int
-
-
-@dataclass
-class _PublishItem:
-    """A queued best-effort write: an HTTP ``method``/``path``/``payload``."""
-
-    method: str
-    path: str
-    payload: dict
 
 
 @dataclass
@@ -62,18 +61,15 @@ class _MatchItem:
     """A queued match query for request ``rid``."""
 
     rid: str
-    model_scope: str
     tokens: list[int]
 
 
 class BlendCoordinatorClient:
     """Background bridge from the blend module to the coordinator directory.
 
-    Thread-safe. Handler threads enqueue publishes and match queries; one daemon
-    thread dequeues them, dispatching each match query to a thread pool so
-    round-trips run concurrently. Match results land in a dict the handler
-    polls. Match queries drain ahead of publishes so lookup latency is not held
-    up by best-effort store traffic.
+    Thread-safe. Handler threads enqueue match queries; one daemon thread
+    dequeues them, dispatching each to a thread pool so round-trips run
+    concurrently. Results land in a dict the handler polls.
     """
 
     def __init__(
@@ -123,7 +119,6 @@ class BlendCoordinatorClient:
         else:
             self._request = request_fn
 
-        self._publish_q: "Queue[_PublishItem]" = Queue()
         self._match_q: "Queue[_MatchItem]" = Queue()
         self._results: dict[str, object] = {}
         self._results_lock = threading.Lock()
@@ -136,43 +131,18 @@ class BlendCoordinatorClient:
         )
         self._worker.start()
 
-    def enqueue_register(self, ranges: list[dict]) -> None:
-        """Queue a best-effort register of stored ranges.
-
-        Args:
-            ranges: Wire-form ``StoreRange`` dicts to register.
-        """
-        if not ranges:
-            return
-        self._publish_q.put(
-            _PublishItem("POST", "/blend/fingerprints", {"ranges": ranges})
-        )
-
-    def enqueue_evict(self, object_keys: list[str]) -> None:
-        """Queue a best-effort eviction of fingerprints by storage key.
-
-        Args:
-            object_keys: ``object_key`` values to evict.
-        """
-        if not object_keys:
-            return
-        self._publish_q.put(
-            _PublishItem("DELETE", "/blend/fingerprints", {"object_keys": object_keys})
-        )
-
-    def submit_match(self, rid: str, model_scope: str, tokens: list[int]) -> None:
+    def submit_match(self, rid: str, tokens: list[int]) -> None:
         """Submit a match query for a request once (idempotent per ``rid``).
 
         Args:
             rid: Request id, the poll key.
-            model_scope: Scope to match within.
             tokens: The request tokens (the coordinator hashes and probes them).
         """
         with self._results_lock:
             if rid in self._results:
                 return
             self._results[rid] = PENDING
-        self._match_q.put(_MatchItem(rid=rid, model_scope=model_scope, tokens=tokens))
+        self._match_q.put(_MatchItem(rid=rid, tokens=tokens))
 
     def poll_match(self, rid: str) -> object:
         """Return the match state for a request.
@@ -236,19 +206,13 @@ class BlendCoordinatorClient:
     # -- daemon ------------------------------------------------------------
 
     def _run(self) -> None:
-        """Dispatch match queries to the pool (priority), then publishes."""
+        """Dispatch queued match queries to the pool."""
         while not self._stop.is_set():
             try:
                 item = self._match_q.get(timeout=0.05)
             except Empty:
-                item = None
-            if item is not None:
-                self._match_pool.submit(self._handle_match, item)
                 continue
-            try:
-                self._handle_publish(self._publish_q.get_nowait())
-            except Empty:
-                pass
+            self._match_pool.submit(self._handle_match, item)
 
     def _handle_match(self, item: _MatchItem) -> None:
         """POST a match query and store the parsed matches (miss on error)."""
@@ -256,15 +220,12 @@ class BlendCoordinatorClient:
         try:
             body = self._request(
                 "POST",
-                "/blend/match",
-                {
-                    "model_scope": item.model_scope,
-                    "tokens_b64": encode_tokens(item.tokens),
-                },
+                "/directory/blend-lookup",
+                {"tokens_b64": encode_tokens(item.tokens)},
             )
             matches = [
                 RemoteMatch(
-                    object_key=m["object_key"],
+                    chunk_hash=m["chunk_hash"],
                     old_st=int(m["old_st"]),
                     cur_st=int(m["cur_st"]),
                 )
@@ -277,12 +238,3 @@ class BlendCoordinatorClient:
             # Only fill if still awaited (not taken/cleared meanwhile).
             if self._results.get(item.rid) is PENDING:
                 self._results[item.rid] = matches
-
-    def _handle_publish(self, item: _PublishItem) -> None:
-        """Send a best-effort register/evict; failures are logged and dropped."""
-        try:
-            self._request(item.method, item.path, item.payload)
-        except Exception as e:
-            logger.warning(
-                "Blend coordinator %s %s failed: %r", item.method, item.path, e
-            )

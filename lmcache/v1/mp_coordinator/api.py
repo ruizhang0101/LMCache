@@ -17,6 +17,13 @@ from enum import Enum
 # First Party
 from lmcache.v1.distributed.api import EncodedObjectKey, Tier
 
+# ``token_offset`` value meaning "the emitter did not report a position".
+# Distinct from 0, which is a real position (a chunk at the start of its
+# sequence): an emitter predating token offsets sends no offset at all, and
+# treating that as 0 would place every chunk at the sequence start and
+# re-RoPE reused KV from the wrong source position.
+UNKNOWN_TOKEN_OFFSET = -1
+
 
 class CacheEventType(str, Enum):
     """The kind of cache-state change a :class:`CacheEventBatch` reports.
@@ -42,20 +49,34 @@ class CacheEventEntry:
         token_ids: The chunk's token ids, stamped on ``store`` entries
             (empty when the emitter no longer holds them); the directory
             indexes them by the key's chunk hash.
+        token_offset: Token position of the chunk's first token in the
+            sequence it was stored under, carried alongside ``token_ids``.
+            Chunk hashes are prefix-chained, so the coordinator cannot
+            derive it; position-dependent reuse (blend re-RoPE) needs it.
+            :data:`UNKNOWN_TOKEN_OFFSET` when the emitter did not report
+            one — the default, so an emitter predating token offsets does
+            not silently claim position 0.
     """
 
     key: EncodedObjectKey
     size_bytes: int = 0
     token_ids: list[int] = field(default_factory=list)
+    token_offset: int = UNKNOWN_TOKEN_OFFSET
 
     def __post_init__(self) -> None:
         """Enforce intrinsic invariants.
 
         Raises:
-            ValueError: If ``size_bytes`` is negative.
+            ValueError: If ``size_bytes`` is negative, or ``token_offset``
+                is negative and not :data:`UNKNOWN_TOKEN_OFFSET`.
         """
         if self.size_bytes < 0:
             raise ValueError(f"size_bytes must be >= 0 (got {self.size_bytes})")
+        if self.token_offset < 0 and self.token_offset != UNKNOWN_TOKEN_OFFSET:
+            raise ValueError(
+                f"token_offset must be >= 0 or UNKNOWN_TOKEN_OFFSET "
+                f"({UNKNOWN_TOKEN_OFFSET}), got {self.token_offset}"
+            )
 
 
 @dataclass(frozen=True)

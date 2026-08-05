@@ -226,6 +226,23 @@ class CoordinatorConfig:
     event_flush_interval: float = 1.0
     """Seconds between cache-event flush attempts to the coordinator."""
 
+    @property
+    def fleet_blend_url(self) -> str:
+        """Coordinator URL for fleet CacheBlend matching, else empty.
+
+        Fleet matching queries the coordinator's content index, which is
+        built purely from this server's cache-event stream — so a URL
+        without :attr:`event_reporting` would query a coordinator that
+        has no cache state to match against. Both are therefore required;
+        with either missing, blend matches locally only.
+
+        Returns:
+            :attr:`url` when fleet matching is available, otherwise ``""``.
+        """
+        if not self.url or not self.event_reporting:
+            return ""
+        return self.url
+
 
 DEFAULT_COORDINATOR_CONFIG = CoordinatorConfig()
 
